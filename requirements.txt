@@ -1,0 +1,9 @@
+psycopg[binary]
+boto3
+kafka-python
+python-dotenv
+requests
+
+apache-airflow-providers-common-sql
+apache-airflow-providers-postgres
+apache-airflow-providers-amazon

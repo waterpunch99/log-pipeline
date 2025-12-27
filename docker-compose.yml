@@ -1,0 +1,77 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    restart: always
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    networks: [app_net]
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    restart: always
+    depends_on: [zookeeper]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    ports: ["9092:9092"]
+    networks: [app_net]
+
+  infra-postgres-1:
+    image: postgres:15
+    container_name: infra-postgres-1
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: event_dw
+    volumes: ["./warehouse/ddl:/docker-entrypoint-initdb.d"]
+    ports: ["5432:5432"]
+    networks: [app_net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d event_dw"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  airflow:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: airflow
+    restart: always
+    depends_on:
+      infra-postgres-1:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    environment:
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+
+      AIRFLOW_CONN_EVENT_DW: postgresql://postgres:postgres@infra-postgres-1:5432/event_dw
+      POSTGRES_DSN: postgresql://postgres:postgres@infra-postgres-1:5432/event_dw
+
+      AWS_REGION: ap-northeast-2
+      S3_BUCKET: event-log-raw-bucket
+      S3_PREFIX: source=github
+      KAFKA_TOPIC: github.raw.events
+
+    volumes:
+      - "./airflow/dags:/opt/airflow/dags"
+      - "./batch:/opt/airflow/batch"
+      - "./ingestion:/opt/airflow/ingestion"
+      - "./warehouse:/opt/airflow/warehouse"
+      - "./.env:/opt/airflow/.env"
+    ports: ["8080:8080"]
+    networks: [app_net]
+    command: ["airflow", "standalone"]
+
+networks:
+  app_net:
+    driver: bridge
