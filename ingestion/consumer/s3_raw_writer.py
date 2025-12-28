@@ -1,14 +1,13 @@
+# ingestion/consumer/s3_raw_writer.py
 import json
 import uuid
 from datetime import datetime, timezone
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Tuple
 
 import boto3
 
 
 class S3RawWriter:
-    
-
     def __init__(self, bucket: str, prefix: str, region: str):
         if not bucket or not prefix or not region:
             raise RuntimeError("Missing bucket/prefix/region for S3RawWriter")
@@ -17,34 +16,47 @@ class S3RawWriter:
         self.prefix = prefix.rstrip("/")
         self.s3 = boto3.client("s3", region_name=region)
 
-    def _parse_created_at(self, event: dict) -> Optional[datetime]:
-        value = event.get("created_at")
+    @staticmethod
+    def _utcnow() -> datetime:
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _parse_created_at(value: Optional[str]) -> Optional[datetime]:
         if not value:
             return None
         try:
             dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
             return dt.astimezone(timezone.utc)
         except Exception:
             return None
 
-    def _build_partition_key(self, state: str, created_at: datetime) -> str:
+    def partition_from_event(self, event: dict) -> Tuple[str, str, datetime]:
+        """
+        이벤트 1건에서 파티션(dt/hour)을 계산합니다.
+        created_at 파싱 실패 시 현재 UTC 시각을 사용합니다.
+        """
+        created_at = self._parse_created_at(event.get("created_at")) or self._utcnow()
         dt = created_at.strftime("%Y-%m-%d")
         hour = created_at.strftime("%H")
-        ts = created_at.strftime("%Y%m%dT%H%M%S")
-        uid = uuid.uuid4().hex[:8]
+        return dt, hour, created_at
 
+    def _build_partition_key(self, state: str, dt: str, hour: str) -> str:
+        ts = self._utcnow().strftime("%Y%m%dT%H%M%S")
+        uid = uuid.uuid4().hex[:8]
         return (
             f"{self.prefix}/raw/{state}/"
             f"dt={dt}/hour={hour}/"
             f"part-{ts}-{uid}.jsonl"
         )
 
-    def write_pending(self, events: Iterable[dict]) -> str:
+    def write_pending(self, events: Iterable[dict], dt: str, hour: str) -> str:
         event_list = list(events)
-        now = datetime.now(timezone.utc)
+        if not event_list:
+            raise ValueError("write_pending() got empty events")
 
-        created_at = self._parse_created_at(event_list[0]) or now
-        key = self._build_partition_key("pending", created_at)
+        key = self._build_partition_key("pending", dt, hour)
         body = self._to_jsonl(event_list)
 
         self.s3.put_object(
@@ -55,8 +67,8 @@ class S3RawWriter:
         )
         return key
 
-    def promote_to_success(self, pending_key: str, created_at: datetime) -> str:
-        success_key = self._build_partition_key("success", created_at)
+    def promote_to_success(self, pending_key: str, dt: str, hour: str) -> str:
+        success_key = self._build_partition_key("success", dt, hour)
 
         self.s3.copy_object(
             Bucket=self.bucket,
@@ -67,8 +79,8 @@ class S3RawWriter:
 
         return success_key
 
-    def move_to_failed(self, pending_key: str, created_at: datetime, reason: Optional[str] = None) -> str:
-        failed_key = self._build_partition_key("failed", created_at)
+    def move_to_failed(self, pending_key: str, dt: str, hour: str, reason: Optional[str] = None) -> str:
+        failed_key = self._build_partition_key("failed", dt, hour)
 
         self.s3.copy_object(
             Bucket=self.bucket,

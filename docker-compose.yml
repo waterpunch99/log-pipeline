@@ -5,21 +5,31 @@ services:
     restart: always
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
-    networks: [app_net]
+    networks:
+      - app_net
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     container_name: kafka
     restart: always
-    depends_on: [zookeeper]
+    depends_on:
+      - zookeeper
     environment:
       KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+
+      # 내부(컨테이너) + 외부(호스트) 리스너 분리
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:29092,EXTERNAL://localhost:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-    ports: ["9092:9092"]
-    networks: [app_net]
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    ports:
+      - "9092:9092"
+    networks:
+      - app_net
 
   infra-postgres-1:
     image: postgres:15
@@ -29,14 +39,12 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: event_dw
-    volumes: ["./warehouse/ddl:/docker-entrypoint-initdb.d"]
-    ports: ["5432:5432"]
-    networks: [app_net]
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d event_dw"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
+    volumes:
+      - "./warehouse/ddl:/docker-entrypoint-initdb.d"
+    ports:
+      - "5432:5432"
+    networks:
+      - app_net
 
   airflow:
     build:
@@ -45,31 +53,23 @@ services:
     container_name: airflow
     restart: always
     depends_on:
-      infra-postgres-1:
-        condition: service_healthy
-      kafka:
-        condition: service_started
+      - kafka
+      - infra-postgres-1
+    env_file:
+      - .env
     environment:
-      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
-      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
-
-      AIRFLOW_CONN_EVENT_DW: postgresql://postgres:postgres@infra-postgres-1:5432/event_dw
-      POSTGRES_DSN: postgresql://postgres:postgres@infra-postgres-1:5432/event_dw
-
-      AWS_REGION: ap-northeast-2
-      S3_BUCKET: event-log-raw-bucket
-      S3_PREFIX: source=github
-      KAFKA_TOPIC: github.raw.events
-
+      # 컨테이너 내부에서는 kafka:29092로 접속
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
     volumes:
       - "./airflow/dags:/opt/airflow/dags"
       - "./batch:/opt/airflow/batch"
       - "./ingestion:/opt/airflow/ingestion"
       - "./warehouse:/opt/airflow/warehouse"
       - "./.env:/opt/airflow/.env"
-    ports: ["8080:8080"]
-    networks: [app_net]
+    ports:
+      - "8080:8080"
+    networks:
+      - app_net
     command: ["airflow", "standalone"]
 
 networks:

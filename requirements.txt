@@ -1,3 +1,5 @@
+# requirements.txt (루트)
+
 psycopg[binary]
 boto3
 kafka-python
