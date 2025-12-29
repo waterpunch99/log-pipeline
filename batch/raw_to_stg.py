@@ -1,3 +1,4 @@
+# batch/raw_to_stg.py
 import argparse
 import json
 import os
@@ -10,57 +11,54 @@ import boto3
 import psycopg
 from dotenv import load_dotenv
 
-# 프로젝트 루트의 .env 로드 (batch/raw_to_stg.py 기준: parents[1]이 루트)
 ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
-# STG: 유니크 인덱스(ux_github_events_stg_event_id_valid)에 걸리면 스킵
-INSERT_STG_SQL = """
-INSERT INTO github_events_stg (
-  event_id,
-  payload,
-  created_at,
-  ingested_at,
-  source_key,
-  loaded_at,
-  is_valid,
-  err_msg
-)
-VALUES (
-  %(event_id)s,
-  %(payload)s::jsonb,
-  %(created_at)s,
-  %(ingested_at)s,
-  %(source_key)s,
-  %(loaded_at)s,
-  %(is_valid)s,
-  %(err_msg)s
-)
-ON CONFLICT DO NOTHING;
-""".strip()
+# 한번에 너무 많이 넣으면 쿼리/파라미터가 커지므로 적당히
+BATCH_FLUSH_ROWS = int(os.getenv("STG_FLUSH_ROWS", "500"))
 
-# 너무 크게 잡으면 행 단위 execute가 오래 걸리니 적당히
-BATCH_FLUSH_ROWS = 500
+# processing lease(임대) 만료 기준(분)
+LEASE_MINUTES = int(os.getenv("STG_LEASE_MINUTES", "30"))
 
-CLAIM_SQL = """
+CLAIM_SQL = f"""
 INSERT INTO stg_file_ingestion_log (source_key, dt, status, run_id, started_at)
 VALUES (%(source_key)s, %(dt)s::date, 'processing', %(run_id)s, now())
 ON CONFLICT (source_key) DO UPDATE
 SET
   status = CASE
-             WHEN stg_file_ingestion_log.status = 'failed' THEN 'processing'
+             WHEN stg_file_ingestion_log.status = 'failed'
+               OR (
+                    stg_file_ingestion_log.status = 'processing'
+                AND stg_file_ingestion_log.started_at < now() - interval '{LEASE_MINUTES} minutes'
+                  )
+             THEN 'processing'
              ELSE stg_file_ingestion_log.status
            END,
   run_id = CASE
-             WHEN stg_file_ingestion_log.status = 'failed' THEN EXCLUDED.run_id
+             WHEN stg_file_ingestion_log.status = 'failed'
+               OR (
+                    stg_file_ingestion_log.status = 'processing'
+                AND stg_file_ingestion_log.started_at < now() - interval '{LEASE_MINUTES} minutes'
+                  )
+             THEN EXCLUDED.run_id
              ELSE stg_file_ingestion_log.run_id
            END,
   started_at = CASE
-                 WHEN stg_file_ingestion_log.status = 'failed' THEN now()
+                 WHEN stg_file_ingestion_log.status = 'failed'
+                   OR (
+                        stg_file_ingestion_log.status = 'processing'
+                    AND stg_file_ingestion_log.started_at < now() - interval '{LEASE_MINUTES} minutes'
+                      )
+                 THEN now()
                  ELSE stg_file_ingestion_log.started_at
                END,
   error_msg = CASE
-                WHEN stg_file_ingestion_log.status = 'failed' THEN NULL
+                WHEN stg_file_ingestion_log.status = 'failed'
+                  OR (
+                       stg_file_ingestion_log.status = 'processing'
+                   AND stg_file_ingestion_log.started_at < now() - interval '{LEASE_MINUTES} minutes'
+                     )
+                THEN NULL
                 ELSE stg_file_ingestion_log.error_msg
               END
 RETURNING status, run_id;
@@ -110,27 +108,68 @@ def _s3_client() -> "boto3.client":
     return boto3.client("s3", region_name=region)
 
 
-def list_partition_keys(bucket: str, prefix: str, dt: str) -> Iterator[str]:
+def _list_json_keys(bucket: str, prefix: str) -> List[str]:
     s3 = _s3_client()
-    partition_prefix = f"{prefix.rstrip('/')}/raw/success/dt={dt}/"
     token: Optional[str] = None
+    out: List[str] = []
 
     while True:
-        args = {"Bucket": bucket, "Prefix": partition_prefix, "MaxKeys": 1000}
+        args = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 1000}
         if token:
             args["ContinuationToken"] = token
 
         resp = s3.list_objects_v2(**args)
-
         for obj in resp.get("Contents", []):
             key = obj["Key"]
-            if key.endswith(".jsonl"):
-                yield key
+            if key.endswith(".json") or key.endswith(".jsonl"):
+                out.append(key)
 
         if not resp.get("IsTruncated"):
             break
-
         token = resp.get("NextContinuationToken")
+
+    out.sort()
+    return out
+
+
+def _get_json(bucket: str, key: str) -> Optional[dict]:
+    s3 = _s3_client()
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        raw = obj["Body"].read()
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def list_partition_keys(bucket: str, prefix: str, dt: str) -> Iterator[str]:
+    """
+    우선순위:
+      1) raw_compacted/_manifest가 있으면, manifest에 적힌 output_key만 사용(시간당 1개, 최신만)
+      2) manifest가 하나도 없으면 raw/success fallback
+    """
+    manifest_prefix = f"{prefix.rstrip('/')}/raw_compacted/_manifest/dt={dt}/"
+    manifest_keys = [k for k in _list_json_keys(bucket, manifest_prefix) if k.endswith("manifest.json")]
+
+    output_keys: List[str] = []
+    for mk in manifest_keys:
+        m = _get_json(bucket, mk)
+        if not m:
+            continue
+        ok = m.get("output_key")
+        if isinstance(ok, str) and ok.endswith(".jsonl"):
+            output_keys.append(ok)
+
+    output_keys = sorted(set(output_keys))
+    if output_keys:
+        for k in output_keys:
+            yield k
+        return
+
+    raw_prefix = f"{prefix.rstrip('/')}/raw/success/dt={dt}/"
+    raw_keys = [k for k in _list_json_keys(bucket, raw_prefix) if k.endswith(".jsonl")]
+    for k in raw_keys:
+        yield k
 
 
 def read_jsonl(bucket: str, key: str) -> Iterable[bytes]:
@@ -152,7 +191,7 @@ def parse_event(line: bytes, source_key: str, loaded_at: datetime) -> Dict:
 
         return {
             "event_id": str(event_id) if event_id is not None else None,
-            "payload": raw_text,
+            "payload": raw_text,  # json string
             "created_at": created_at,
             "ingested_at": ingested_at,
             "source_key": source_key,
@@ -177,31 +216,45 @@ def parse_event(line: bytes, source_key: str, loaded_at: datetime) -> Dict:
 
 def _flush(cur: "psycopg.Cursor", buffer: List[Dict]) -> int:
     """
-    inserted_count를 정확히 집계하기 위해 행 단위로 rowcount(0/1)를 합산합니다.
-    (unique index 충돌로 스킵되면 rowcount=0)
+    멀티 로우 INSERT + RETURNING으로 inserted_count를 정확히 집계합니다.
+    - ON CONFLICT DO NOTHING으로 스킵된 행은 RETURNING에 안 잡히므로 카운트에 포함되지 않음
+    - 행 단위 execute 대비 DB 왕복이 크게 줄어듦
     """
     if not buffer:
         return 0
 
-    inserted = 0
-    for row in buffer:
-        cur.execute(INSERT_STG_SQL, row)
-        # psycopg rowcount는 INSERT 성공 시 1, DO NOTHING이면 0
-        inserted += max(cur.rowcount, 0)
-    return inserted
+    # VALUES (%s, %s::jsonb, %s, ... ) 를 N개 생성
+    values_sql = ",".join(["(%s,%s::jsonb,%s,%s,%s,%s,%s,%s)"] * len(buffer))
+    sql = f"""
+    INSERT INTO github_events_stg (
+      event_id, payload, created_at, ingested_at, source_key, loaded_at, is_valid, err_msg
+    )
+    VALUES {values_sql}
+    ON CONFLICT DO NOTHING
+    RETURNING 1;
+    """.strip()
+
+    params: List[object] = []
+    for r in buffer:
+        params.extend(
+            [
+                r.get("event_id"),
+                r.get("payload"),
+                r.get("created_at"),
+                r.get("ingested_at"),
+                r.get("source_key"),
+                r.get("loaded_at"),
+                r.get("is_valid"),
+                r.get("err_msg"),
+            ]
+        )
+
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    return len(rows)
 
 
 def _claim_file(cur: "psycopg.Cursor", source_key: str, dt: str, run_id: str) -> Tuple[bool, str]:
-    """
-    반환:
-      (should_process, status)
-
-    규칙:
-      - 신규: processing(내 run_id) → 진행
-      - done: 스킵
-      - failed: processing으로 전환(내 run_id) → 재처리
-      - processing인데 run_id가 다름: 다른 실행이 처리 중 → 스킵
-    """
     cur.execute(CLAIM_SQL, {"source_key": source_key, "dt": dt, "run_id": run_id})
     status, owner_run_id = cur.fetchone()
 
@@ -237,6 +290,8 @@ def main(dt: str) -> None:
                 total_files_seen += 1
 
                 should_process, _ = _claim_file(cur, key, dt, run_id)
+                conn.commit()  # claim 상태를 즉시 반영
+
                 if not should_process:
                     total_files_skipped += 1
                     continue
@@ -267,6 +322,7 @@ def main(dt: str) -> None:
                             "inserted_count": inserted,
                         },
                     )
+                    conn.commit()
 
                     total_files_processed += 1
                     total_rows += rows
@@ -283,12 +339,13 @@ def main(dt: str) -> None:
                             "error_msg": str(e),
                         },
                     )
+                    conn.commit()
                     print(f"[FAIL] key={key} error={e}")
 
     print(
         f"[OK] raw_to_stg dt={dt} run_id={run_id} "
         f"files_seen={total_files_seen} files_processed={total_files_processed} files_skipped={total_files_skipped} "
-        f"rows={total_rows} inserted={total_inserted}"
+        f"rows={total_rows} inserted={total_inserted} lease_minutes={LEASE_MINUTES} flush_rows={BATCH_FLUSH_ROWS}"
     )
 
 
