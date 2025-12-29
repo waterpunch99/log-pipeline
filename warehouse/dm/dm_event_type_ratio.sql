@@ -1,34 +1,33 @@
+-- warehouse/dm/dm_event_type_ratio.sql
+-- run_id로 영향 받은 시간대만 재계산
+
 WITH targets AS (
   SELECT source_key
   FROM stg_file_ingestion_log
-  WHERE run_id = %(run_id)s
-    AND status = 'done'
+  WHERE run_id=%(run_id)s AND status='done'
 ),
 affected_hours AS (
   SELECT DISTINCT date_trunc('hour', s.created_at) AS event_hour
   FROM github_events_stg s
   JOIN targets t ON t.source_key = s.source_key
-  WHERE s.is_valid = true
-    AND s.created_at IS NOT NULL
+  WHERE s.is_valid=true AND s.created_at IS NOT NULL
 ),
 total AS (
   SELECT
-    date_trunc('hour', d.created_at) AS event_hour,
+    date_trunc('hour', created_at) AS event_hour,
     COUNT(*) AS event_total
-  FROM github_events_dw d
-  JOIN affected_hours h
-    ON h.event_hour = date_trunc('hour', d.created_at)
+  FROM github_events_dw
+  WHERE date_trunc('hour', created_at) IN (SELECT event_hour FROM affected_hours)
   GROUP BY 1
 ),
 typed AS (
   SELECT
-    date_trunc('hour', d.created_at) AS event_hour,
-    d.event_type,
+    date_trunc('hour', created_at) AS event_hour,
+    event_type,
     COUNT(*) AS event_count
-  FROM github_events_dw d
-  JOIN affected_hours h
-    ON h.event_hour = date_trunc('hour', d.created_at)
-  WHERE d.event_type IS NOT NULL
+  FROM github_events_dw
+  WHERE date_trunc('hour', created_at) IN (SELECT event_hour FROM affected_hours)
+    AND event_type IS NOT NULL
   GROUP BY 1, 2
 )
 INSERT INTO dm_event_type_ratio (
