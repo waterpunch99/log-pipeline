@@ -2,7 +2,6 @@
 import argparse
 import json
 import os
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
@@ -14,10 +13,7 @@ from dotenv import load_dotenv
 ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
-# 한번에 너무 많이 넣으면 쿼리/파라미터가 커지므로 적당히
 BATCH_FLUSH_ROWS = int(os.getenv("STG_FLUSH_ROWS", "500"))
-
-# processing lease(임대) 만료 기준(분)
 LEASE_MINUTES = int(os.getenv("STG_LEASE_MINUTES", "30"))
 
 CLAIM_SQL = f"""
@@ -143,11 +139,6 @@ def _get_json(bucket: str, key: str) -> Optional[dict]:
 
 
 def list_partition_keys(bucket: str, prefix: str, dt: str) -> Iterator[str]:
-    """
-    우선순위:
-      1) raw_compacted/_manifest가 있으면, manifest에 적힌 output_key만 사용(시간당 1개, 최신만)
-      2) manifest가 하나도 없으면 raw/success fallback
-    """
     manifest_prefix = f"{prefix.rstrip('/')}/raw_compacted/_manifest/dt={dt}/"
     manifest_keys = [k for k in _list_json_keys(bucket, manifest_prefix) if k.endswith("manifest.json")]
 
@@ -191,7 +182,7 @@ def parse_event(line: bytes, source_key: str, loaded_at: datetime) -> Dict:
 
         return {
             "event_id": str(event_id) if event_id is not None else None,
-            "payload": raw_text,  # json string
+            "payload": raw_text,
             "created_at": created_at,
             "ingested_at": ingested_at,
             "source_key": source_key,
@@ -199,7 +190,6 @@ def parse_event(line: bytes, source_key: str, loaded_at: datetime) -> Dict:
             "is_valid": True,
             "err_msg": None,
         }
-
     except Exception as e:
         safe_raw = line.decode("utf-8", errors="ignore")
         return {
@@ -215,15 +205,9 @@ def parse_event(line: bytes, source_key: str, loaded_at: datetime) -> Dict:
 
 
 def _flush(cur: "psycopg.Cursor", buffer: List[Dict]) -> int:
-    """
-    멀티 로우 INSERT + RETURNING으로 inserted_count를 정확히 집계합니다.
-    - ON CONFLICT DO NOTHING으로 스킵된 행은 RETURNING에 안 잡히므로 카운트에 포함되지 않음
-    - 행 단위 execute 대비 DB 왕복이 크게 줄어듦
-    """
     if not buffer:
         return 0
 
-    # VALUES (%s, %s::jsonb, %s, ... ) 를 N개 생성
     values_sql = ",".join(["(%s,%s::jsonb,%s,%s,%s,%s,%s,%s)"] * len(buffer))
     sql = f"""
     INSERT INTO github_events_stg (
@@ -250,8 +234,7 @@ def _flush(cur: "psycopg.Cursor", buffer: List[Dict]) -> int:
         )
 
     cur.execute(sql, params)
-    rows = cur.fetchall()
-    return len(rows)
+    return len(cur.fetchall())
 
 
 def _claim_file(cur: "psycopg.Cursor", source_key: str, dt: str, run_id: str) -> Tuple[bool, str]:
@@ -260,23 +243,19 @@ def _claim_file(cur: "psycopg.Cursor", source_key: str, dt: str, run_id: str) ->
 
     if status == "done":
         return False, "done"
-
     if status == "processing" and owner_run_id == run_id:
         return True, "processing"
-
     return False, "processing"
 
 
-def main(dt: str) -> None:
+def main(dt: str, run_id: str) -> None:
     bucket = os.getenv("S3_BUCKET")
     prefix = os.getenv("S3_PREFIX")
     dsn = os.getenv("POSTGRES_DSN")
-
     if not bucket or not prefix or not dsn:
         raise RuntimeError("Missing env config: S3_BUCKET / S3_PREFIX / POSTGRES_DSN")
 
     loaded_at = _utcnow()
-    run_id = uuid.uuid4().hex
 
     total_rows = 0
     total_inserted = 0
@@ -290,7 +269,7 @@ def main(dt: str) -> None:
                 total_files_seen += 1
 
                 should_process, _ = _claim_file(cur, key, dt, run_id)
-                conn.commit()  # claim 상태를 즉시 반영
+                conn.commit()
 
                 if not should_process:
                     total_files_skipped += 1
@@ -304,7 +283,6 @@ def main(dt: str) -> None:
                     for line in read_jsonl(bucket, key):
                         buffer.append(parse_event(line, key, loaded_at))
                         rows += 1
-
                         if len(buffer) >= BATCH_FLUSH_ROWS:
                             inserted += _flush(cur, buffer)
                             buffer.clear()
@@ -349,12 +327,13 @@ def main(dt: str) -> None:
     )
 
 
-def run(dt: str) -> None:
-    main(dt)
+def run(dt: str, run_id: str) -> None:
+    main(dt, run_id)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dt", required=True, help="YYYY-MM-DD")
+    parser.add_argument("--run-id", required=True, help="run id (uuid hex)")
     args = parser.parse_args()
-    main(args.dt)
+    main(args.dt, args.run_id)

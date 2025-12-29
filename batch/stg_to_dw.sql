@@ -1,19 +1,24 @@
-WITH src AS (
+WITH targets AS (
+  SELECT source_key
+  FROM stg_file_ingestion_log
+  WHERE run_id = %(run_id)s
+    AND status = 'done'
+),
+src AS (
   SELECT
-    event_id,
-    payload,
-    created_at,
-    ingested_at,
+    s.event_id,
+    s.payload,
+    s.created_at,
+    s.ingested_at,
     ROW_NUMBER() OVER (
-      PARTITION BY event_id
-      ORDER BY ingested_at DESC, created_at DESC
+      PARTITION BY s.event_id
+      ORDER BY s.ingested_at DESC, s.created_at DESC
     ) AS rn
-  FROM github_events_stg
-  WHERE is_valid = true
-    AND created_at IS NOT NULL
-    AND created_at >= %(window_start)s::timestamptz
-    AND created_at <  %(window_end)s::timestamptz
-    AND event_id IS NOT NULL
+  FROM github_events_stg s
+  JOIN targets t ON t.source_key = s.source_key
+  WHERE s.is_valid = true
+    AND s.created_at IS NOT NULL
+    AND s.event_id IS NOT NULL
 ),
 dedup AS (
   SELECT
