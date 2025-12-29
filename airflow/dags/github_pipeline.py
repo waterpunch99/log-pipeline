@@ -1,139 +1,192 @@
-# /opt/airflow/dags/github_pipeline.py
+# airflow/dags/github_pipeline.py
 
 from __future__ import annotations
 
 import os
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from airflow import DAG
-from airflow.operators.python import PythonOperator, ShortCircuitOperator
+from airflow.operators.python import PythonOperator
+from airflow.operators.python import ShortCircuitOperator
 from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 
-
-def _dt_list(execution_date: datetime, overlap_days: int) -> list[str]:
-    # execution_date는 Airflow 쪽에서 UTC datetime으로 들어오는 경우가 많습니다.
-    # dt는 배치 스크립트가 쓰는 YYYY-MM-DD 형태로 맞춥니다.
-    base = execution_date.date()
-    days = [base - timedelta(days=i) for i in reversed(range(overlap_days))]
-    return [d.isoformat() for d in days]
+# 늦게 도착한 이벤트 흡수: raw_to_stg는 최근 N일 dt 파티션 재스캔
+OVERLAP_DAYS = 2
 
 
-def has_new_files_task(**context) -> bool:
-    """
-    '새 파일이 없으면 스킵' 최적화용.
-    구현은 프로젝트마다 다른데, 기존에 이미 잘 동작하고 있으니 그대로 두고 싶으면
-    이 함수 내용을 당신 코드로 교체하셔도 됩니다.
-
-    여기서는 보수적으로 '항상 True'로 두어서 파이프라인이 확실히 진행되게 합니다.
-    (어차피 raw_to_stg / stg_to_dw가 idempotent면 데이터는 망가지지 않습니다.)
-    """
-    return True
+def _new_run_id() -> str:
+    return uuid.uuid4().hex
 
 
 def compact_then_raw_to_stg_task(**context) -> str:
     """
-    1) S3 raw 소형 파일 -> 시간단위 컴팩션(raw_compacted)
-    2) raw_compacted -> Postgres STG 적재 + ingestion log 기록
-    run_id를 만들어서 downstream에 넘깁니다.
+    1) (옵션) raw small files -> raw_compacted로 컴팩션
+    2) raw_to_stg로 최근 N일 dt 파티션 재스캔 (멱등: 파일 단위 로그로 스킵/재시도)
+    반환값(run_id)은 XCom으로 전달되어 stg_to_dw/dq/dm이 동일 run_id로 동작합니다.
     """
-    from batch.compact_raw import run as compact_raw_run
+    interval_start = context["data_interval_start"]
+    run_id = _new_run_id()
+
+    # 1) compaction: 있다면 수행(없어도 넘어가도록)
+    try:
+        from batch.compact_raw import run as compact_run
+
+        for i in range(OVERLAP_DAYS, -1, -1):
+            dt = (interval_start - timedelta(days=i)).strftime("%Y-%m-%d")
+            compact_run(dt=dt)
+    except Exception as e:
+        # compaction이 없거나 실패해도 raw_to_stg는 진행시키고, 로그로 남김
+        print(f"[WARN] compaction skipped/failed: {e}")
+
+    # 2) raw_to_stg
     from batch.raw_to_stg import run as raw_to_stg_run
 
-    execution_date: datetime = context["execution_date"]
-    overlap_days = int(os.getenv("PIPELINE_OVERLAP_DAYS", "3"))
-    run_id = uuid.uuid4().hex
-
-    for dt in _dt_list(execution_date, overlap_days):
-        # compact는 내부적으로 '이미 성공 산출물이 있으면 SKIP'하도록 설계되어 있어야 합니다.
-        compact_raw_run(dt=dt)
+    for i in range(OVERLAP_DAYS, -1, -1):
+        dt = (interval_start - timedelta(days=i)).strftime("%Y-%m-%d")
         raw_to_stg_run(dt=dt, run_id=run_id)
 
     print(f"[OK] compact_then_raw_to_stg run_id={run_id}")
     return run_id
 
 
+def has_new_files_task(**context) -> bool:
+    """
+    이번 run_id로 실제 신규 적재(inserted_count)가 0이면 downstream 전체 스킵.
+    """
+    ti = context["ti"]
+    run_id = ti.xcom_pull(task_ids="compact_then_raw_to_stg")
+    if not run_id:
+        print("[SKIP] run_id missing -> downstream skipped")
+        return False
+
+    import psycopg
+
+    dsn = os.getenv("POSTGRES_DSN")
+    if not dsn:
+        raise RuntimeError("Missing env: POSTGRES_DSN")
+
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  COALESCE(SUM(inserted_count), 0) AS inserted_total,
+                  COALESCE(SUM(row_count), 0) AS row_total,
+                  COUNT(1) FILTER (WHERE status='done') AS done_files,
+                  COUNT(1) FILTER (WHERE status='skipped') AS skipped_files,
+                  COUNT(1) FILTER (WHERE status='failed') AS failed_files
+                FROM stg_file_ingestion_log
+                WHERE run_id=%s
+                  AND status IN ('done','skipped','failed')
+                """,
+                (run_id,),
+            )
+            inserted_total, row_total, done_files, skipped_files, failed_files = cur.fetchone()
+
+    inserted_total = int(inserted_total or 0)
+    row_total = int(row_total or 0)
+    done_files = int(done_files or 0)
+    skipped_files = int(skipped_files or 0)
+    failed_files = int(failed_files or 0)
+
+    print(
+        f"[GATE] run_id={run_id} inserted_total={inserted_total} row_total={row_total} "
+        f"done_files={done_files} skipped_files={skipped_files} failed_files={failed_files}"
+    )
+
+    if inserted_total == 0:
+        print(f"[SKIP] no newly inserted stg rows for this run. run_id={run_id} -> downstream skipped")
+        return False
+
+    print(f"[OK] newly inserted rows exist. run_id={run_id} inserted_total={inserted_total}")
+    return True
+
+
 def dq_after_dw_task(**context) -> None:
     """
-    dw 적재 후 DQ 체크
+    dq_checks를 subprocess가 아니라 패키지 import로 직접 실행합니다.
     """
-    from batch import dq_checks
-
-    run_id = context["ti"].xcom_pull(task_ids="compact_then_raw_to_stg")
+    ti = context["ti"]
+    run_id = ti.xcom_pull(task_ids="compact_then_raw_to_stg")
     if not run_id:
-        # upstream에서 실제 처리된 파일이 없어서 run_id가 None이 될 수 있습니다.
-        print("[DQ][DW] no run_id. skip.")
+        print("[DQ][DW] missing run_id -> skip")
         return
-    dq_checks.run(run_id=run_id, stage="dw")
+
+    from batch.dq_checks import run as dq_run
+
+    dq_run(run_id=run_id, stage="dw")
 
 
 def dq_after_dm_task(**context) -> None:
     """
-    dm 적재 후 DQ 체크
+    dq_checks를 subprocess가 아니라 패키지 import로 직접 실행합니다.
     """
-    from batch import dq_checks
-
-    run_id = context["ti"].xcom_pull(task_ids="compact_then_raw_to_stg")
+    ti = context["ti"]
+    run_id = ti.xcom_pull(task_ids="compact_then_raw_to_stg")
     if not run_id:
-        print("[DQ][DM] no run_id. skip.")
+        print("[DQ][DM] missing run_id -> skip")
         return
-    dq_checks.run(run_id=run_id, stage="dm")
+
+    from batch.dq_checks import run as dq_run
+
+    dq_run(run_id=run_id, stage="dm")
 
 
 with DAG(
     dag_id="event_log_pipeline",
-    description="GitHub events pipeline: compact -> stg -> dw -> dm -> dq",
-    start_date=datetime(2025, 12, 29),
-    schedule="0 * * * *",  # 매시 정각(UTC)
+    start_date=datetime(2025, 12, 23, tzinfo=timezone.utc),
+    schedule="@daily",
     catchup=False,
-    max_active_runs=1,
+    tags=["github", "pipeline"],
+    default_args={"retries": 3, "retry_delay": timedelta(minutes=2)},
     template_searchpath=[
         "/opt/airflow/batch",
-        "/opt/airflow/warehouse",
+        "/opt/airflow/warehouse/ddl",
+        "/opt/airflow/warehouse/dm",
     ],
-    default_args={"owner": "airflow", "retries": 3, "retry_delay": timedelta(minutes=2)},
 ) as dag:
-    has_new_files = ShortCircuitOperator(
-        task_id="has_new_files",
-        python_callable=has_new_files_task,
-    )
-
-    compact_then_raw_to_stg = PythonOperator(
+    t1 = PythonOperator(
         task_id="compact_then_raw_to_stg",
         python_callable=compact_then_raw_to_stg_task,
     )
 
-    stg_to_dw = SQLExecuteQueryOperator(
-        task_id="stg_to_dw",
-        conn_id="event_dw",  # Airflow Connection에 event_dw가 설정되어 있어야 합니다.
-        sql="stg_to_dw.sql",  # template_searchpath에 /opt/airflow/batch를 넣어서 경로문제 제거
-        parameters={
-            "run_id": "{{ ti.xcom_pull(task_ids='compact_then_raw_to_stg') }}",
-        },
+    gate = ShortCircuitOperator(
+        task_id="has_new_files",
+        python_callable=has_new_files_task,
     )
 
-    dq_after_dw = PythonOperator(
+    # stg_to_dw는 run_id 기반 증분(upsert)
+    t2 = SQLExecuteQueryOperator(
+        task_id="stg_to_dw",
+        conn_id="event_dw",
+        sql="stg_to_dw.sql",
+        parameters={"run_id": "{{ ti.xcom_pull(task_ids='compact_then_raw_to_stg') }}"},
+    )
+
+    dq1 = PythonOperator(
         task_id="dq_after_dw",
         python_callable=dq_after_dw_task,
     )
 
-    dm_hourly_volume = SQLExecuteQueryOperator(
+    # DM도 run_id로 영향 시간대만 재계산
+    t3 = SQLExecuteQueryOperator(
         task_id="dm_hourly_volume",
         conn_id="event_dw",
-        sql="dm/dm_hourly_event_volume.sql",
+        sql="dm_hourly_event_volume.sql",
         parameters={"run_id": "{{ ti.xcom_pull(task_ids='compact_then_raw_to_stg') }}"},
     )
 
-    dm_type_ratio = SQLExecuteQueryOperator(
+    t4 = SQLExecuteQueryOperator(
         task_id="dm_type_ratio",
         conn_id="event_dw",
-        sql="dm/dm_event_type_ratio.sql",
+        sql="dm_event_type_ratio.sql",
         parameters={"run_id": "{{ ti.xcom_pull(task_ids='compact_then_raw_to_stg') }}"},
     )
 
-    dq_after_dm = PythonOperator(
+    dq2 = PythonOperator(
         task_id="dq_after_dm",
         python_callable=dq_after_dm_task,
     )
 
-    has_new_files >> compact_then_raw_to_stg >> stg_to_dw >> dq_after_dw >> dm_hourly_volume >> dm_type_ratio >> dq_after_dm
+    t1 >> gate >> t2 >> dq1 >> t3 >> t4 >> dq2

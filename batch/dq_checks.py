@@ -1,8 +1,9 @@
-# batch/dq_checks.py
 import argparse
+import json
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from decimal import Decimal
+from typing import Any, Dict, Optional, Tuple
 
 import psycopg
 
@@ -26,9 +27,72 @@ def _get_thresholds() -> Thresholds:
     )
 
 
+def _fail_mode() -> str:
+    """
+    DQ_FAIL_MODE:
+      - hard: 실패 시 예외 발생(기본값)
+      - soft: 실패해도 예외는 던지지 않고 결과만 기록
+    """
+    mode = (os.getenv("DQ_FAIL_MODE", "hard") or "hard").strip().lower()
+    return "soft" if mode == "soft" else "hard"
+
+
 def _q(cur: "psycopg.Cursor", sql: str, params: Optional[Dict[str, Any]] = None):
     cur.execute(sql, params or {})
     return cur.fetchone()
+
+
+def _to_numeric(v: Optional[float]) -> Optional[Decimal]:
+    if v is None:
+        return None
+    try:
+        return Decimal(str(v))
+    except Exception:
+        return None
+
+
+def _upsert_dq_result(
+    cur: "psycopg.Cursor",
+    *,
+    run_id: str,
+    stage: str,
+    check_name: str,
+    passed: bool,
+    severity: str,
+    measured_value: Optional[float] = None,
+    threshold_value: Optional[float] = None,
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
+    cur.execute(
+        """
+        INSERT INTO dq_check_results (
+          run_id, stage, check_name, passed, severity,
+          measured_value, threshold_value, details, checked_at
+        )
+        VALUES (
+          %(run_id)s, %(stage)s, %(check_name)s, %(passed)s, %(severity)s,
+          %(measured_value)s, %(threshold_value)s, %(details)s::jsonb, now()
+        )
+        ON CONFLICT (run_id, stage, check_name)
+        DO UPDATE SET
+          passed=EXCLUDED.passed,
+          severity=EXCLUDED.severity,
+          measured_value=EXCLUDED.measured_value,
+          threshold_value=EXCLUDED.threshold_value,
+          details=EXCLUDED.details,
+          checked_at=now()
+        """,
+        {
+            "run_id": run_id,
+            "stage": stage,
+            "check_name": check_name,
+            "passed": passed,
+            "severity": severity,
+            "measured_value": _to_numeric(measured_value),
+            "threshold_value": _to_numeric(threshold_value),
+            "details": json.dumps(details or {}, ensure_ascii=False),
+        },
+    )
 
 
 def _get_targets_exist(cur: "psycopg.Cursor", run_id: str) -> int:
@@ -37,7 +101,7 @@ def _get_targets_exist(cur: "psycopg.Cursor", run_id: str) -> int:
         """
         SELECT COUNT(1)
         FROM stg_file_ingestion_log
-        WHERE run_id=%(run_id)s AND status='done'
+        WHERE run_id=%(run_id)s AND status IN ('done','skipped')
         """,
         {"run_id": run_id},
     )
@@ -50,15 +114,31 @@ def dq_after_dw(run_id: str) -> None:
         raise RuntimeError("Missing env: POSTGRES_DSN")
 
     th = _get_thresholds()
+    mode = _fail_mode()
+
+    hard_fail = False
+    hard_fail_reason = ""
 
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
-            files_done = _get_targets_exist(cur, run_id)
-            if files_done == 0:
-                print(f"[DQ][DW] run_id={run_id} no done files. Skipping checks (PASS).")
+            files_done_or_skipped = _get_targets_exist(cur, run_id)
+            if files_done_or_skipped == 0:
+                _upsert_dq_result(
+                    cur,
+                    run_id=run_id,
+                    stage="dw",
+                    check_name="targets_exist",
+                    passed=True,
+                    severity="soft",
+                    measured_value=0.0,
+                    threshold_value=0.0,
+                    details={"msg": "no done/skipped files for this run_id. skipping DW checks."},
+                )
+                conn.commit()
+                print(f"[DQ][DW] run_id={run_id} no done/skipped files. Skipping checks (PASS).")
                 return
 
-            # STG 품질
+            # STG 품질 (이번 run_id의 done 파일만 대상으로 품질 체크)
             stg = _q(
                 cur,
                 """
@@ -91,27 +171,78 @@ def dq_after_dw(run_id: str) -> None:
             null_created_at_rate = (null_created_at / stg_rows) if stg_rows else 0.0
 
             print(
-                f"[DQ][DW] run_id={run_id} files_done={files_done} "
+                f"[DQ][DW] run_id={run_id} files_done_or_skipped={files_done_or_skipped} "
                 f"stg_rows={stg_rows} valid_rows={valid_rows} invalid_rows={invalid_rows} "
                 f"null_created_at={null_created_at} null_event_id={null_event_id} distinct_valid_event_ids={stg_distinct_valid_ids} "
                 f"valid_rate={valid_rate:.4f} null_created_at_rate={null_created_at_rate:.4f}"
             )
 
+            # 체크 1: STG rows 존재
+            _upsert_dq_result(
+                cur,
+                run_id=run_id,
+                stage="dw",
+                check_name="stg_rows_nonzero",
+                passed=(stg_rows > 0),
+                severity="soft",
+                measured_value=float(stg_rows),
+                threshold_value=1.0,
+                details={
+                    "stg_rows": stg_rows,
+                    "valid_rows": valid_rows,
+                    "invalid_rows": invalid_rows,
+                    "note": "stg_rows==0이면 downstream 영향이 없을 수 있어 soft로 둠",
+                },
+            )
+
             if stg_rows == 0:
+                conn.commit()
                 print(f"[DQ][DW] run_id={run_id} STG has 0 rows for this run. PASS.")
                 return
 
-            if valid_rate < th.min_valid_rate:
-                raise RuntimeError(
-                    f"[DQ_FAIL][DW] valid_rate too low: {valid_rate:.4f} < {th.min_valid_rate}"
-                )
+            # 체크 2: valid_rate
+            passed_valid_rate = valid_rate >= th.min_valid_rate
+            _upsert_dq_result(
+                cur,
+                run_id=run_id,
+                stage="dw",
+                check_name="stg_valid_rate",
+                passed=passed_valid_rate,
+                severity="hard",
+                measured_value=float(valid_rate),
+                threshold_value=float(th.min_valid_rate),
+                details={
+                    "stg_rows": stg_rows,
+                    "valid_rows": valid_rows,
+                    "invalid_rows": invalid_rows,
+                },
+            )
+            if not passed_valid_rate:
+                hard_fail = True
+                hard_fail_reason = f"valid_rate too low: {valid_rate:.4f} < {th.min_valid_rate}"
 
-            if null_created_at_rate > th.max_null_created_at_rate:
-                raise RuntimeError(
-                    f"[DQ_FAIL][DW] null_created_at_rate too high: {null_created_at_rate:.4f} > {th.max_null_created_at_rate}"
-                )
+            # 체크 3: null_created_at_rate
+            passed_null_created = null_created_at_rate <= th.max_null_created_at_rate
+            _upsert_dq_result(
+                cur,
+                run_id=run_id,
+                stage="dw",
+                check_name="stg_null_created_at_rate",
+                passed=passed_null_created,
+                severity="hard",
+                measured_value=float(null_created_at_rate),
+                threshold_value=float(th.max_null_created_at_rate),
+                details={
+                    "stg_rows": stg_rows,
+                    "null_created_at": null_created_at,
+                },
+            )
+            if not passed_null_created:
+                hard_fail = True
+                if not hard_fail_reason:
+                    hard_fail_reason = f"null_created_at_rate too high: {null_created_at_rate:.4f} > {th.max_null_created_at_rate}"
 
-            # DW 반영 확인(이번 run에서 본 event_id들이 DW에 실제로 존재하는지)
+            # DW 반영 확인: 이번 run에서 본 event_id들이 DW에 존재하는지
             dw = _q(
                 cur,
                 """
@@ -141,12 +272,32 @@ def dq_after_dw(run_id: str) -> None:
                 f"[DQ][DW] run_id={run_id} stg_distinct_valid_ids={stg_distinct} dw_matched={dw_matched} match_rate={match_rate:.4f}"
             )
 
-            if match_rate < th.min_dw_match_rate:
-                raise RuntimeError(
-                    f"[DQ_FAIL][DW] dw_match_rate too low: {match_rate:.4f} < {th.min_dw_match_rate}"
-                )
+            passed_match_rate = match_rate >= th.min_dw_match_rate
+            _upsert_dq_result(
+                cur,
+                run_id=run_id,
+                stage="dw",
+                check_name="dw_match_rate",
+                passed=passed_match_rate,
+                severity="hard",
+                measured_value=float(match_rate),
+                threshold_value=float(th.min_dw_match_rate),
+                details={
+                    "stg_distinct_valid_ids": stg_distinct,
+                    "dw_matched": dw_matched,
+                },
+            )
+            if not passed_match_rate:
+                hard_fail = True
+                if not hard_fail_reason:
+                    hard_fail_reason = f"dw_match_rate too low: {match_rate:.4f} < {th.min_dw_match_rate}"
 
-    print(f"[DQ_PASS][DW] run_id={run_id}")
+            conn.commit()
+
+    if hard_fail and mode == "hard":
+        raise RuntimeError(f"[DQ_FAIL][DW] run_id={run_id} {hard_fail_reason}")
+
+    print(f"[DQ_PASS][DW] run_id={run_id} mode={mode}")
 
 
 def dq_after_dm(run_id: str) -> None:
@@ -155,15 +306,30 @@ def dq_after_dm(run_id: str) -> None:
         raise RuntimeError("Missing env: POSTGRES_DSN")
 
     th = _get_thresholds()
+    mode = _fail_mode()
+
+    hard_fail = False
+    hard_fail_reason = ""
 
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
-            files_done = _get_targets_exist(cur, run_id)
-            if files_done == 0:
-                print(f"[DQ][DM] run_id={run_id} no done files. Skipping checks (PASS).")
+            files_done_or_skipped = _get_targets_exist(cur, run_id)
+            if files_done_or_skipped == 0:
+                _upsert_dq_result(
+                    cur,
+                    run_id=run_id,
+                    stage="dm",
+                    check_name="targets_exist",
+                    passed=True,
+                    severity="soft",
+                    measured_value=0.0,
+                    threshold_value=0.0,
+                    details={"msg": "no done/skipped files for this run_id. skipping DM checks."},
+                )
+                conn.commit()
+                print(f"[DQ][DM] run_id={run_id} no done/skipped files. Skipping checks (PASS).")
                 return
 
-            # 이번 run이 영향을 준 hour 집합
             hrs = _q(
                 cur,
                 """
@@ -186,11 +352,23 @@ def dq_after_dm(run_id: str) -> None:
 
             print(f"[DQ][DM] run_id={run_id} affected_hours={affected_hours}")
 
+            _upsert_dq_result(
+                cur,
+                run_id=run_id,
+                stage="dm",
+                check_name="affected_hours_nonzero",
+                passed=(affected_hours > 0),
+                severity="soft",
+                measured_value=float(affected_hours),
+                threshold_value=1.0,
+                details={"affected_hours": affected_hours},
+            )
+
             if affected_hours == 0:
+                conn.commit()
                 print(f"[DQ][DM] run_id={run_id} affected_hours=0. PASS.")
                 return
 
-            # dm_hourly_event_volume 커버리지
             miss_hourly = _q(
                 cur,
                 """
@@ -219,12 +397,23 @@ def dq_after_dm(run_id: str) -> None:
 
             print(f"[DQ][DM] run_id={run_id} missing_dm_hourly_rows={missing_hourly}")
 
-            if th.require_dm_hourly_coverage and missing_hourly > 0:
-                raise RuntimeError(
-                    f"[DQ_FAIL][DM] dm_hourly_event_volume missing hours: {missing_hourly}"
-                )
+            passed_hourly_cov = (missing_hourly == 0) if th.require_dm_hourly_coverage else True
+            _upsert_dq_result(
+                cur,
+                run_id=run_id,
+                stage="dm",
+                check_name="dm_hourly_coverage",
+                passed=passed_hourly_cov,
+                severity="hard" if th.require_dm_hourly_coverage else "soft",
+                measured_value=float(missing_hourly),
+                threshold_value=0.0,
+                details={"missing_hours": missing_hourly, "require": th.require_dm_hourly_coverage},
+            )
 
-            # dm_event_type_ratio는 typed 이벤트가 존재하는 hour에 대해서만 존재해야 함
+            if th.require_dm_hourly_coverage and missing_hourly > 0:
+                hard_fail = True
+                hard_fail_reason = f"dm_hourly_event_volume missing hours: {missing_hourly}"
+
             miss_typed = _q(
                 cur,
                 """
@@ -264,12 +453,38 @@ def dq_after_dm(run_id: str) -> None:
                 f"[DQ][DM] run_id={run_id} typed_hour_cnt={typed_hour_cnt} missing_typed_hours={missing_typed_hours}"
             )
 
-            if th.require_dm_type_ratio_when_typed_exists and typed_hour_cnt > 0 and missing_typed_hours > 0:
-                raise RuntimeError(
-                    f"[DQ_FAIL][DM] dm_event_type_ratio missing typed hours: {missing_typed_hours}"
-                )
+            require_type_ratio = th.require_dm_type_ratio_when_typed_exists
+            passed_type_ratio = True
+            if require_type_ratio and typed_hour_cnt > 0 and missing_typed_hours > 0:
+                passed_type_ratio = False
 
-    print(f"[DQ_PASS][DM] run_id={run_id}")
+            _upsert_dq_result(
+                cur,
+                run_id=run_id,
+                stage="dm",
+                check_name="dm_type_ratio_coverage_when_typed_exists",
+                passed=passed_type_ratio,
+                severity="hard" if require_type_ratio else "soft",
+                measured_value=float(missing_typed_hours),
+                threshold_value=0.0,
+                details={
+                    "typed_hour_cnt": typed_hour_cnt,
+                    "missing_typed_hours": missing_typed_hours,
+                    "require": require_type_ratio,
+                },
+            )
+
+            if require_type_ratio and typed_hour_cnt > 0 and missing_typed_hours > 0:
+                hard_fail = True
+                if not hard_fail_reason:
+                    hard_fail_reason = f"dm_event_type_ratio missing typed hours: {missing_typed_hours}"
+
+            conn.commit()
+
+    if hard_fail and mode == "hard":
+        raise RuntimeError(f"[DQ_FAIL][DM] run_id={run_id} {hard_fail_reason}")
+
+    print(f"[DQ_PASS][DM] run_id={run_id} mode={mode}")
 
 
 def run(run_id: str, stage: str) -> None:

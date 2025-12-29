@@ -1,9 +1,9 @@
--- warehouse/ddl/02_stg_file_ingestion_log.sql
+-- warehouse/ddl/004_stg_file_ingestion_log.sql
 
 CREATE TABLE IF NOT EXISTS stg_file_ingestion_log (
   source_key      text PRIMARY KEY,
   dt              date NOT NULL,
-  status          text NOT NULL CHECK (status IN ('processing', 'done', 'failed')),
+  status          text NOT NULL CHECK (status IN ('processing', 'done', 'skipped', 'failed')),
   run_id          text,
   started_at      timestamptz NOT NULL DEFAULT now(),
   finished_at     timestamptz,
